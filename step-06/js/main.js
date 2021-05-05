@@ -29,6 +29,10 @@ snapBtn.addEventListener('click', snapPhoto);
 sendBtn.addEventListener('click', sendPhoto);
 snapAndSendBtn.addEventListener('click', snapAndSend);
 
+// Disable send buttons by default.
+sendBtn.disabled = true;
+snapAndSendBtn.disabled = true;
+
 // Create a random room if not already present in the URL.
 var isInitiator;
 var room = window.location.hash.substring(1);
@@ -82,12 +86,35 @@ socket.on('message', function(message) {
   signalingMessageCallback(message);
 });
 
-// Join a room
+// Joining a room.
 socket.emit('create or join', room);
 
 if (location.hostname.match(/localhost|127\.0\.0/)) {
   socket.emit('ipaddr');
 }
+
+// Leaving rooms and disconnecting from peers.
+socket.on('disconnect', function(reason) {
+  console.log(`Disconnected: ${reason}.`);
+  sendBtn.disabled = true;
+  snapAndSendBtn.disabled = true;
+});
+
+socket.on('bye', function(room) {
+  console.log(`Peer leaving room ${room}.`);
+  sendBtn.disabled = true;
+  snapAndSendBtn.disabled = true;
+  // If peer did not create the room, re-enter to be creator.
+  if (!isInitiator) {
+    window.location.reload();
+  }
+});
+
+window.addEventListener('unload', function() {
+  console.log(`Unloading window. Notifying peers in ${room}.`);
+  socket.emit('bye', room);
+});
+
 
 /**
 * Send message to signaling server
@@ -127,14 +154,13 @@ function grabWebCamVideo() {
 }
 
 function gotStream(stream) {
-  var streamURL = window.URL.createObjectURL(stream);
-  console.log('getUserMedia video stream URL:', streamURL);
+  console.log('getUserMedia video stream URL:', stream);
   window.stream = stream; // stream available to console
-  video.src = streamURL;
+  video.srcObject = stream;
   video.onloadedmetadata = function() {
     photo.width = photoContextW = video.videoWidth;
     photo.height = photoContextH = video.videoHeight;
-    console.log('gotStream with with and height:', photoContextW, photoContextH);
+    console.log('gotStream with width and height:', photoContextW, photoContextH);
   };
   show(snapBtn);
 }
@@ -160,12 +186,12 @@ function signalingMessageCallback(message) {
 
   } else if (message.type === 'candidate') {
     peerConn.addIceCandidate(new RTCIceCandidate({
-      candidate: message.candidate
+      candidate: message.candidate,
+      sdpMLineIndex: message.label,
+      sdpMid: message.id
     }));
-
-  } else if (message === 'bye') {
-// TODO: cleanup RTC connection?
-}
+    
+  }
 }
 
 function createPeerConnection(isInitiator, config) {
@@ -194,7 +220,15 @@ if (isInitiator) {
   onDataChannelCreated(dataChannel);
 
   console.log('Creating an offer');
-  peerConn.createOffer(onLocalSessionCreated, logError);
+  peerConn.createOffer().then(function(offer) {
+    return peerConn.setLocalDescription(offer);
+  })
+  .then(() => {
+    console.log('sending local desc:', peerConn.localDescription);
+    sendMessage(peerConn.localDescription);
+  })
+  .catch(logError);
+
 } else {
   peerConn.ondatachannel = function(event) {
     console.log('ondatachannel:', event.channel);
@@ -206,10 +240,10 @@ if (isInitiator) {
 
 function onLocalSessionCreated(desc) {
   console.log('local session created:', desc);
-  peerConn.setLocalDescription(desc, function() {
+  peerConn.setLocalDescription(desc).then(function() {
     console.log('sending local desc:', peerConn.localDescription);
     sendMessage(peerConn.localDescription);
-  }, logError);
+  }).catch(logError);
 }
 
 function onDataChannelCreated(channel) {
@@ -217,7 +251,15 @@ function onDataChannelCreated(channel) {
 
   channel.onopen = function() {
     console.log('CHANNEL opened!!!');
+    sendBtn.disabled = false;
+    snapAndSendBtn.disabled = false;
   };
+
+  channel.onclose = function () {
+    console.log('Channel closed.');
+    sendBtn.disabled = true;
+    snapAndSendBtn.disabled = true;
+  }
 
   channel.onmessage = (adapter.browserDetails.browser === 'firefox') ?
   receiveDataFirefoxFactory() : receiveDataChromeFactory();
@@ -305,6 +347,16 @@ len = img.data.byteLength,
 n = len / CHUNK_LEN | 0;
 
 console.log('Sending a total of ' + len + ' byte(s)');
+
+if (!dataChannel) {
+  logError('Connection has not been initiated. ' +
+    'Get two peers in the same room first');
+  return;
+} else if (dataChannel.readyState === 'closed') {
+  logError('Connection was lost. Peer closed the connection.');
+  return;
+}
+
 dataChannel.send(len);
 
 // split the photo and send in chunks of about 64KB
@@ -358,5 +410,10 @@ function randomToken() {
 }
 
 function logError(err) {
-  console.log(err.toString(), err);
+  if (!err) return;
+  if (typeof err === 'string') {
+    console.warn(err);
+  } else {
+    console.warn(err.toString(), err);
+  }
 }
